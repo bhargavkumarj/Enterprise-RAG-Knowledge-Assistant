@@ -1,0 +1,45 @@
+# Retrieval quality gate for the shipped configuration (see README "CI quality gate").
+#
+# Baseline: 5 fresh CPU-only runs (python:3.11-slim, linux/amd64, torch 2.14.1+cpu),
+# each rebuilding the store with `ingest.py --strategy markdown` and evaluating the
+# 60 held-out questions. 4 of 5 runs gave identical numbers, matching the README; one
+# run differed on two comparative questions (nDCG 0.9642, comparative 0.9855) because
+# a different chunk entered the re-ranker's top-20 candidates. Every value below is
+# the lowest measured across those runs, truncated to 4 decimals.
+# The check fails when actual < measured - tolerance.
+
+report: reports/holdout-*.json
+
+expect:
+  questions: 60
+  config:
+    k: 6
+    use_rewrite: false
+    use_rerank: true
+  manifest:
+    chunk_strategy: markdown
+    fingerprint: huggingface:sentence-transformers/all-MiniLM-L6-v2
+    chunks: 659
+
+tolerance:
+  # On 60 questions one miss costs hit@k 0.0167 and one rank-1 -> rank-2 slip costs
+  # MRR 0.0083. Observed run-to-run spread on these metrics was at most 0.0025.
+  aggregate: 0.02
+  # Categories hold 4-28 questions, so a single question regressing badly in a small
+  # category fails the gate. Observed run-to-run spread: 0.037 (comparative).
+  category: 0.05
+
+metrics:
+  hit_rate: {measured: 1.0000}
+  mrr: {measured: 0.9750}
+  ndcg: {measured: 0.9616}
+
+# nDCG per category; held-out question counts in brackets.
+category_ndcg:
+  comparative: {measured: 0.9480}   # [4]
+  direct_fact: {measured: 0.9780}   # [28]
+  holistic: {measured: 0.9974}      # [4]
+  numerical: {measured: 0.9957}     # [4]
+  relationship: {measured: 0.9957}  # [4]
+  spanning: {measured: 0.9301}      # [8]
+  temporal: {measured: 0.8909}      # [8]
