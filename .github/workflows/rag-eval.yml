@@ -1,0 +1,154 @@
+name: RAG eval
+
+on:
+  pull_request:
+    paths:
+      - "rag/**"
+      - "ingest.py"
+      - "evaluate.py"
+      - "data/**"
+      - "requirements.txt"
+      - "eval/**"
+      - ".github/workflows/rag-eval.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rag-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+# The shipped configuration from the README. Set explicitly because the code
+# defaults (recursive chunking, query rewriting, LLM re-ranker) differ from it.
+env:
+  CHUNK_STRATEGY: markdown
+  EMBEDDING_BACKEND: huggingface
+  HF_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+  TOP_K: "6"
+  REWRITE_QUERY: "false"
+  RERANK: "true"
+  RERANKER: cross-encoder
+  CROSS_ENCODER_MODEL: cross-encoder/ms-marco-MiniLM-L-6-v2
+  TOKENIZERS_PARALLELISM: "false"
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  retrieval-gate:
+    name: Tier 1 · retrieval quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # No API key is exposed here. Every chat-model path builds ChatOpenAI, which
+    # raises without a key, so an accidental LLM call fails the job loudly.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Cache Hugging Face models
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-all-MiniLM-L6-v2-ms-marco-MiniLM-L-6-v2-v1
+
+      - name: Install dependencies (CPU-only torch)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+          pip freeze > installed-packages.txt
+
+      - name: Build vector store
+        run: python ingest.py --strategy markdown
+
+      - name: Evaluate held-out retrieval
+        run: python evaluate.py --split holdout --k 6
+
+      - name: Check thresholds
+        run: python eval/check_thresholds.py
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieval-report
+          path: |
+            reports/*.json
+            vector_store/manifest.json
+            installed-packages.txt
+          if-no-files-found: warn
+
+  answer-quality:
+    name: Tier 2 · answer quality (LLM judge)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CHAT_BACKEND: openai
+    steps:
+      - name: Check for OpenAI key
+        id: key
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "::notice title=Tier 2 skipped::OPENAI_API_KEY secret is not configured, so answer grading was skipped."
+            echo "### Tier 2 skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "The \`OPENAI_API_KEY\` repository secret is not configured, so answers were not generated or judged." >> "$GITHUB_STEP_SUMMARY"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.present == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.key.outputs.present == 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Cache Hugging Face models
+        if: steps.key.outputs.present == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: hf-${{ runner.os }}-all-MiniLM-L6-v2-ms-marco-MiniLM-L-6-v2-v1
+
+      - name: Install dependencies (CPU-only torch)
+        if: steps.key.outputs.present == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements.txt
+
+      - name: Build vector store
+        if: steps.key.outputs.present == 'true'
+        run: python ingest.py --strategy markdown
+
+      # Report-only: no judge baseline has been measured with the OpenAI judge yet.
+      - name: Generate and judge answers
+        if: steps.key.outputs.present == 'true'
+        run: |
+          python evaluate.py --split holdout --k 6 --answers | tee eval-output.txt
+          {
+            echo "### Tier 2 · answer quality (report only)"
+            echo '```'
+            sed -n '/^configuration/,$p' eval-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reports
+        if: always() && steps.key.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: answer-quality-report
+          path: reports/*.json
+          if-no-files-found: warn
