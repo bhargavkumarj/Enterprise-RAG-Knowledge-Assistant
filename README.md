@@ -1,5 +1,7 @@
 # Enterprise RAG Knowledge Assistant
 
+[![RAG eval](https://github.com/bhargavkumarj/Enterprise-RAG-Knowledge-Assistant/actions/workflows/rag-eval.yml/badge.svg)](https://github.com/bhargavkumarj/Enterprise-RAG-Knowledge-Assistant/actions/workflows/rag-eval.yml)
+
 A question-answering assistant over a private, multi-document company knowledge
 base — company records, product sheets, signed contracts and employee files.
 Answers are grounded in retrieved extracts, and the UI shows the extracts next to
@@ -95,6 +97,56 @@ weak embedding signals and appear in many chunks that are otherwise unrelated.
 
 Reports land in `reports/` as JSON with per-question detail, so a regression in
 one category is visible rather than averaged away.
+
+## CI quality gate
+
+[`.github/workflows/rag-eval.yml`](.github/workflows/rag-eval.yml) re-runs the
+held-out retrieval evaluation and fails the build if quality regresses.
+
+**Tier 1 — every PR and push to `main`.** Runs on PRs that touch `rag/`,
+`ingest.py`, `evaluate.py`, `data/`, `requirements.txt` or `eval/`. It installs
+CPU-only torch, builds a fresh store with `ingest.py --strategy markdown`, and
+evaluates the shipped configuration on the 60 held-out questions:
+`all-MiniLM-L6-v2` embeddings, k=6, cross-encoder re-ranking, no query rewriting.
+The code defaults differ (recursive chunking, rewriting on, LLM re-ranker), so the
+workflow sets `CHUNK_STRATEGY`, `REWRITE_QUERY`, `RERANK` and `RERANKER`
+explicitly. This path makes no LLM calls, and no API key is available to the job,
+so any chat-model call would fail it rather than pass silently.
+[`eval/check_thresholds.py`](eval/check_thresholds.py) then compares the report
+with [`eval/thresholds.yaml`](eval/thresholds.yaml), writes a pass/fail table to
+the job summary, and exits non-zero on any failure. The reports are uploaded as a
+build artifact.
+
+**Thresholds.** The baseline comes from five fresh CPU-only runs (Linux x86_64,
+Python 3.11). Four matched the table above exactly. One differed on two
+comparative questions, because a different chunk made the re-ranker's top-20
+candidates when the index was rebuilt, so the baseline uses the lowest value
+measured. A check fails when a metric falls more than **0.02** below baseline for
+hit@k, MRR and nDCG, or more than **0.05** for any single category's nDCG. On 60
+questions, one miss costs hit@k 0.017, so 0.02 absorbs build noise but not a real
+loss. Categories hold only 4–28 questions, so one badly regressed question in
+`temporal` fails the gate even when the overall average still passes. The gate
+also checks that the report and store match the expected configuration (60
+questions, k=6, markdown chunking, the expected embedding model, 659 chunks).
+
+Reproduce locally (without a `.env` file, which would override these variables):
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements.txt
+python ingest.py --strategy markdown
+REWRITE_QUERY=false RERANK=true RERANKER=cross-encoder python evaluate.py --split holdout --k 6
+python eval/check_thresholds.py
+```
+
+To move the baseline after an intended change, re-measure as above and update the
+`measured` values in `eval/thresholds.yaml` in the same PR.
+
+**Tier 2 — manual only.** The `answer-quality` job runs on `workflow_dispatch`. It
+runs `evaluate.py --answers` with the LLM judge, using the `OPENAI_API_KEY`
+repository secret. If the secret is missing, the job is skipped with a notice. Its
+scores are report-only, with no thresholds, until a baseline has been measured with
+the OpenAI judge.
 
 ## Design notes
 
